@@ -35,6 +35,159 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+	for {
+		taskInfo := CallAskTask()
+		switch taskInfo.State {
+		case TaskMap:
+			workerMap(mapf, taskInfo)
+			break
+		case TaskReduce:
+			workerReduce(reducef, taskInfo)
+			break
+		case TaskWait:
+			// wait for 5 seconds to requeset again
+			time.Sleep(time.Duration(time.Second * 5))
+			break
+		case TaskEnd:
+			fmt.Println("Coordinator all tasks complete. Nothing to do...")
+			// exit worker process
+			return
+		default:
+			panic("Invalid Task state received by worker")
+		}
+	}
+
+}
+
+func CallAskTask() *TaskInfo {
+	args := ExampleArgs{}
+	reply := TaskInfo{}
+	call("Coordinator.AskTask", &args, &reply)
+	return &reply
+}
+
+func CallTaskDone(taskInfo *TaskInfo) {
+	reply := ExampleReply{}
+	call("Coordinator.TaskDone", taskInfo, &reply)
+}
+
+func workerMap(mapf func(string, string) []KeyValue, taskInfo *TaskInfo) {
+	fmt.Printf("Got assigned map task on %vth file %v\n", taskInfo.FileIndex, taskInfo.FileName)
+
+	// read in target files as a key-value array
+	intermediate := []KeyValue{}
+	file, err := os.Open(taskInfo.FileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", taskInfo.FileName)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", taskInfo.FileName)
+	}
+	file.Close()
+	kva := mapf(taskInfo.FileName, string(content))
+	intermediate = append(intermediate, kva...)
+
+	// prepare output files and encoders
+	nReduce := taskInfo.NReduce
+	outprefix := "mr-tmp/mr-"
+	outprefix += strconv.Itoa(taskInfo.FileIndex)
+	outprefix += "-"
+	outFiles := make([]*os.File, nReduce)
+	fileEncs := make([]*json.Encoder, nReduce)
+	for outindex := 0; outindex < nReduce; outindex++ {
+		//outname := outprefix + strconv.Itoa(outindex)
+		//outFiles[outindex], _ = os.Create(outname)
+		outFiles[outindex], _ = ioutil.TempFile("mr-tmp", "mr-tmp-*")
+		fileEncs[outindex] = json.NewEncoder(outFiles[outindex])
+	}
+
+	// distribute keys among mr-fileindex-*
+	for _, kv := range intermediate {
+		outindex := ihash(kv.Key) % nReduce
+		file = outFiles[outindex]
+		enc := fileEncs[outindex]
+		err := enc.Encode(&kv)
+		if err != nil {
+			fmt.Printf("File %v Key %v Value %v Error: %v\n", taskInfo.FileName, kv.Key, kv.Value, err)
+			panic("Json encode failed")
+		}
+	}
+
+	// save as files
+	for outindex, file := range outFiles {
+		outname := outprefix + strconv.Itoa(outindex)
+		oldpath := filepath.Join(file.Name())
+		//fmt.Printf("temp file oldpath %v\n", oldpath)
+		os.Rename(oldpath, outname)
+		file.Close()
+	}
+	// acknowledge master
+	CallTaskDone(taskInfo)
+}
+
+func workerReduce(reducef func(string, []string) string, taskInfo *TaskInfo) {
+	fmt.Printf("Got assigned reduce task on part %v\n", taskInfo.PartIndex)
+	outname := "mr-out-" + strconv.Itoa(taskInfo.PartIndex)
+	//fmt.Printf("%v\n", taskInfo)
+
+	// read from output files from map tasks
+
+	innameprefix := "mr-tmp/mr-"
+	innamesuffix := "-" + strconv.Itoa(taskInfo.PartIndex)
+
+	// read in all files as a kv array
+	intermediate := []KeyValue{}
+	for index := 0; index < taskInfo.NFiles; index++ {
+		inname := innameprefix + strconv.Itoa(index) + innamesuffix
+		file, err := os.Open(inname)
+		if err != nil {
+			fmt.Printf("Open intermediate file %v failed: %v\n", inname, err)
+			panic("Open file error")
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				//fmt.Printf("%v\n", err)
+				break
+			}
+			//fmt.Printf("%v\n", kv)
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	//ofile, err := os.Create(outname)
+	ofile, err := ioutil.TempFile("mr-tmp", "mr-*")
+	if err != nil {
+		fmt.Printf("Create output file %v failed: %v\n", outname, err)
+		panic("Create file error")
+	}
+	//fmt.Printf("%v\n", intermediate)
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+	os.Rename(filepath.Join(ofile.Name()), outname)
+	ofile.Close()
+	// acknowledge master
+	CallTaskDone(taskInfo)
 
 }
 
